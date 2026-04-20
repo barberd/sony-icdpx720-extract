@@ -66,9 +66,13 @@ The protocol uses vendor control transfers on endpoint 0 for commands and bulk t
 
 Each recording is stored as raw MP3 on the device's internal flash.
 
+## Known limitations
+
+The device stores file sizes as flash memory addresses in an internal table. This tool assumes the table entries are in the same order as the file listing. Its possible that if recordings have been deleted and added, the mapping between files and their flash table entries may get fragmented and this assumption proven incorrect. Its possible the extOffset field in every file entry is used to determine the correct mapping, but this isn't fully reverse engineered at this time. Pull requests welcome if you figure this out.
+
 ## Compatibility
 
-Tested with the Sony ICD-PX720. May work with other ICD-PX series recorders that use the same USB protocol (VID `054c`, PID `0387`).
+Tested with the Sony ICD-PX720. May work with other ICD-PX series recorders that use the same USB protocol. Maybe try adjusting the code to work with the USB vendor and device ID for your recorder.
 
 ## GenAI Usage
 
