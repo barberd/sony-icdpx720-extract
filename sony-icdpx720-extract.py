@@ -78,16 +78,21 @@ def main():
             flash_table = pkt
     poll_wait(dev); read(dev, 24); poll(dev)
 
-    # Parse flash table
+    # Parse flash table — entries map 1:1 with file listing order
+    # Multi-segment files use consecutive entries; last segment has bit 31 set in end_high
     sizes, exact = {}, {}
     if flash_table:
+        n, total = 0, 0
         for i in range(0, len(flash_table)-15, 16):
             v = struct.unpack('>IIII', flash_table[i:i+16])
             if v[0] == 0xffffffff: break
             s = (v[0]<<32)|v[1]; e = ((v[2]&0x7fffffff)<<32)|v[3]
-            n = len(sizes)+1
-            sizes[n] = math.ceil((e-s)/1024)
-            exact[n] = e-s+1
+            total += e - s + 1
+            if v[2] & 0x80000000:  # last segment
+                n += 1
+                sizes[n] = math.ceil(total / 1024)
+                exact[n] = total
+                total = 0
 
     if not files:
         print("No recordings found."); return

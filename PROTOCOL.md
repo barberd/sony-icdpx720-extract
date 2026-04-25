@@ -144,9 +144,14 @@ Offset  Size  Description
 12-15   u32   end_addr_low
 ```
 
-Each record represents one recording's location on flash. Terminated by
+Each record represents one segment of a recording's location on flash. Terminated by
 `0xffffffff`. File size in bytes = `end - start + 1` (where end has bit 31
 masked off in the high word). Block count = `ceil((end - start) / 1024)`.
+
+If bit 31 of `end_addr_high` is set (`0x80000000`), this is the last (or only)
+segment of the file. If clear, the next record continues the same file.
+Multi-segment files occur when a recording spans non-contiguous flash regions
+(e.g. after deletions create gaps). Total file size = sum of all segment sizes.
 
 **File Entry** (1 packet each, starting ~packet index 15):
 Identified by first 4 bytes = `ff ff 90 00`.
@@ -175,25 +180,16 @@ Offset  Size  Description
 0x1cb   1     Unknown (0x05 for 2025 recordings)
 0x1cc   11    Device name "SONY ICD-PX" (null-terminated)
 0x1e4   8     Constant 33 09 0c 01 14 68 65 5f (firmware/serial?)
-0x1ff   1     ExtOffset — index into device's internal segment table
+0x1ff   1     Unknown — possibly a device-internal flash block identifier
 ```
 
 Files starting with "Z" (e.g. Z0000040) are system/empty slots, not recordings.
 
-### ExtOffset (byte at 0x1ff)
+### Byte at 0x1ff
 
-Used by Sony's software (IcdNStor3.dll `GetMsgDataSize`) to locate the correct
-flash address table entry for a given file. The lookup involves:
-
-1. Read ExtOffset byte from file entry
-2. Combine with folder number: `(ExtOffset + folder * 256) * 16`
-3. Index into segment table to find flash start/end addresses
-
-**IMPORTANT**: This tool does NOT use ExtOffset. It assumes flash table entries
-are in the same order as file listing entries. This works for devices where
-recordings have not been deleted and re-recorded. A more robust implementation
-would decode the ExtOffset lookup to correctly map files to flash entries.
-The full lookup algorithm is in IcdNStor3.dll `GetMsgDataSize` (see dev/IcdNStor3.dll.txt).
+Purpose not fully understood. Values observed (0xa0, 0x2e, 0xeb, 0x95) don't
+correlate with file listing order or flash table position. May be a
+device-internal flash block identifier. Not needed for extraction.
 
 ## Download Protocol
 
@@ -250,7 +246,7 @@ ID3 tags but the audio portion is exactly `flash_end - flash_start + 1` bytes).
 ```
 Digital Voice Editor
   └── PXVoice.dll        — PX-series device handler, adds ID3 tags on save
-      └── IcdNStor3.dll   — Storage abstraction, file size calculation, ExtOffset lookup
+      └── IcdNStor3.dll   — Storage abstraction, file size calculation
           └── IcdComm4.dll — USB protocol layer (SendCmd, ReceiveCmd, BulkComm, GetReceiveStatus)
               └── ICDUSB3.sys — Kernel driver (WDF, vendor USB class)
 ```
@@ -272,16 +268,20 @@ for endian conversion — the protocol is big-endian on the wire.
 
 ## Open Questions
 
-1. **ExtOffset mapping**: How exactly does ExtOffset map file entries to flash
-   table entries after deletions/reordering? The disassembly shows a multi-step
-   lookup but we haven't fully decoded it.
+1. **Byte at 0x1ff in file entries**: Values (e.g. 0xa0, 0x2e, 0xeb) and the
+   data at bulk offset 0xa00 appear related to an internal mapping scheme, but
+   the device maintains flash table entries in the same order as the file
+   listing. The DLL's `SetTocMemory` overwrites the 0xa00 data with the flash
+   address table from 0xe00 during initialization. The TOC table at offset
+   0x000 maps file indices sequentially (0,1,2...) even after deletions.
+   These byte values may be device-internal flash block identifiers.
 
 2. **Byte at 0x1c0**: Purpose unknown. Values don't correlate with file size,
    duration, or recording quality. Not needed for extraction.
 
 3. **File 090101_008**: Present in file listing but has no flash table entry.
-   May be in a different folder or use a different storage format. ExtOffset
-   for this file was 0x95 vs 0xa0/0x2e/0xeb for the three working files.
+   May be in a different folder or use a different storage format. The byte
+   at 0x1ff for this file was 0x95 vs 0xa0/0x2e/0xeb for the three working files.
 
 4. **Multiple folders**: Only tested with folder "F" (all files). Selecting
    individual folders (A-E) may require different SELECT_FOLDER parameters.

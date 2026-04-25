@@ -66,9 +66,9 @@ The protocol uses vendor control transfers on endpoint 0 for commands and bulk t
 
 Each recording is stored as raw MP3 on the device's internal flash.
 
-## Known limitations
+## Known quirks
 
-The device stores file sizes as flash memory addresses in an internal table. This tool assumes the table entries are in the same order as the file listing. Its possible that if recordings have been deleted and added, the mapping between files and their flash table entries may get fragmented and this assumption proven incorrect. Its possible the extOffset field in every file entry is used to determine the correct mapping, but this isn't fully reverse engineered at this time. Pull requests welcome if you figure this out.
+- File `090101_008` (a system-generated entry with no matching flash table record) is skipped during extraction.
 
 ## Compatibility
 
