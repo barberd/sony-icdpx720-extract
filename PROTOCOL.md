@@ -67,7 +67,7 @@ Followed by a 2-byte command code, then command-specific payload.
 | 09 00 | QUERY | sub(1) + 0xff + 8×0x00 | Query device info. sub: 01=device info, 03=capabilities, 04=storage |
 | 09 20 | LIST_READ | 00 ff + 8×0x00 | Read next page of folder/file listing |
 | 09 10 | LIST_END | 01 ff + 8×0x00 | End listing, triggers bulk file entry dump |
-| 0a 00 | SELECT_FOLDER | sub + payload | Select folder. sub=04: by index, sub=01: by name |
+| 0a 00 | SET_PREFERENCE | sub + payload | Set device preferences (CIcdComm4::SetPreferenceMenu). Used to select folder view. |
 | 11 ff | READ_FILE | 26-byte payload | Download file data |
 
 ### QUERY Responses
@@ -78,9 +78,17 @@ Followed by a 2-byte command code, then command-specific payload.
 | 0x03 | 48 bytes | Unknown, possibly capabilities. Needs 2+ polls before ready. |
 | 0x04 | 82 bytes | Storage info |
 
-### SELECT_FOLDER
+### SET_PREFERENCE (SetPreferenceMenu)
 
-The "select all folders" command (folder "F") is a fixed 50-byte packet:
+Command 0x0a with sub-command at offset 0x0d-0x0e. This is
+`CIcdComm4::SetPreferenceMenu`, which writes a 26-byte
+`_SETPREFERENCEMENUFORVOCE` struct to the device. Sony's software
+(PXVoice.dll) reads the current preferences from the device, updates the
+timestamp with the current local time, and writes them back during
+initialization. The folder view byte (offset 0x25) controls which folder
+the subsequent LIST commands enumerate.
+
+The "all folders" variant (folder "F") is a fixed 50-byte packet:
 
 ```
 00e000080046abab 00000000 0a0004 50 0000001a
@@ -88,8 +96,33 @@ The "select all folders" command (folder "F") is a fixed 50-byte packet:
 0000 0101 07ea 0413 101e 0900
 ```
 
-- Byte at offset 0x17 (0x46 = 'F') selects the folder
-- Last 8 bytes appear to be a timestamp (0x07ea=2026, etc.) — not validated by device
+Packet structure:
+
+```
+Offset  Size  Description
+0x00    12    Magic header
+0x0c    1     Command = 0x0a
+0x0d    2     htons(sub-command): 0x0004=by-index, 0x0001=by-name
+0x0f    1     Constant 0x50 ('P')
+0x10    4     htonl(0x1a) — payload size (26 bytes)
+0x14    4     htonl(0x00)
+0x18    26    _SETPREFERENCEMENUFORVOCE struct (copied mostly raw, uint16 at
+              struct offset 0x0c is byte-swapped via htons)
+```
+
+Key fields in the 26-byte struct (at packet offset 0x18):
+
+```
+Struct   Packet
+offset   offset   Description
+0x11     0x29     Folder letter: 'A'-'E' for individual folders, 'F' for all
+0x16     0x2e     Timestamp: year (big-endian uint16)
+0x18     0x30     Timestamp: month, day
+0x1a     0x32     Timestamp: hour, minute (only 2 bytes shown; seconds follow)
+```
+
+A second variant uses sub-command 0x0001 (by-name) with the folder name as a
+string (e.g. "User") in the payload instead of the struct.
 
 ### READ_FILE Payload (26 bytes = 13 big-endian uint16)
 
@@ -118,7 +151,7 @@ Block size = 1024 bytes. Each block = 2 bulk packets (512 bytes each).
 2. QUERY 0x01 → POLL_WAIT → READ(116) → POLL
 3. QUERY 0x03 → POLL_WAIT → READ(48) → POLL    (may need 2+ polls)
 4. QUERY 0x04 → POLL_WAIT → READ(82) → POLL
-5. SELECT_FOLDER "F" → POLL_WAIT → READ(24) → POLL
+5. SET_PREFERENCE "F" → POLL_WAIT → READ(24) → POLL
 6. LIST_READ ×3 → (each: POLL_WAIT → READ(356) → POLL)
 7. LIST_END → POLL_WAIT → READ(24)
 8. [bulk file listing packets]
@@ -366,8 +399,12 @@ for endian conversion — the protocol is big-endian on the wire.
 - `sony-protocol-session.txt` — Annotated protocol decode of the capture
 - `sony-replay.py` — Replays the exact capture sequence (used to verify protocol)
 - `extract-from-pcap.py` — Extracts MP3 files directly from the pcap
+- `dump-toc.py` — Dumps TOC table, flash address table, and file entries from device
 - `IcdNStor3.dll.txt` — Ghidra disassembly of storage layer
 - `IcdComm4.dll.txt` — Ghidra disassembly of USB protocol layer
+- `PXVoice.dll.txt` — Ghidra disassembly of PX-series device handler (COM server)
+- `DVEdit.exe.txt` — Ghidra disassembly of Digital Voice Editor main application
+- `IcdPCons.dll.txt` — Ghidra disassembly of ICD PC Console
 - `shared/Sony/` — Original Sony software from DVE3 installer
 - `shared/IcdComm4.dll` — Extracted from DVESetup_EN.exe via unshield
 - `shared/001_A_*.mp3` — Reference files saved by Digital Voice Editor (with ID3 tags)
@@ -390,7 +427,8 @@ for endian conversion — the protocol is big-endian on the wire.
    at 0x1ff for this file was 0x95 vs 0xa0/0x2e/0xeb for the three working files.
 
 4. **Multiple folders**: Only tested with folder "F" (all files). Selecting
-   individual folders (A-E) may require different SELECT_FOLDER parameters.
+   individual folders (A-E) likely requires changing the folder byte (offset
+   0x25) in the SET_PREFERENCE packet.
 
 5. **Write support**: The protocol likely supports uploading/deleting recordings
    but this has not been explored.

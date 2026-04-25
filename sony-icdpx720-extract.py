@@ -55,7 +55,10 @@ def main():
     send(dev, M+b'\x09\x00\x03\xff'+b'\x00'*8); poll_wait(dev); read(dev, 48); poll(dev)
     send(dev, M+b'\x09\x00\x04\xff'+b'\x00'*8); poll_wait(dev); read(dev, 82); poll(dev)
 
-    # Select folder F
+    # Set preference menu — selects folder "F" (all files view)
+    # This is CIcdComm4::SetPreferenceMenu with a _SETPREFERENCEMENUFORVOCE struct.
+    # The struct is normally read from the device, timestamp updated, and written back.
+    # Byte at offset 0x25 (0x46='F') controls the folder view.
     send(dev, '00e000080046abab000000000a0004500000001a000000000001000000000001ff00ff0000460000010107ea0413101e0900')
     poll_wait(dev); read(dev, 24); poll(dev)
 
