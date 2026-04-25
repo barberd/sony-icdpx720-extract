@@ -233,6 +233,112 @@ exact_file_size = flash_end - flash_start + 1  # for trimming output
 The `+1` was confirmed by matching against Digital Voice Editor output (which adds
 ID3 tags but the audio portion is exactly `flash_end - flash_start + 1` bytes).
 
+## Delete Protocol (from disassembly, not tested)
+
+Decoded from `CIcdComm4::DeleteMessage` in IcdComm4.dll. **Not captured in any
+USB session — the following is based solely on disassembly and has not been
+verified against a real device.**
+
+### Command
+
+Standard 12-byte magic header, followed by:
+
+```
+Offset  Size  Description
+0x0c    1     Command = 0x12
+0x0e    1     Folder ID (param_1, a single byte)
+0x0f    1     0x00
+0x10    2     htons(file_index)
+0x12    99    Deletion mask (optional, 99 bytes from caller — possibly a
+              bitmap of which files to delete, or zeros)
+```
+
+Total command size: 0x75 (117) bytes. Sent via `SendCmd`, response via
+`ReceiveCmd`.
+
+### Observed behavior
+
+Deleting a recording removes its flash address table entry but leaves the
+file entry packet (the `ffff9000` record) in the bulk listing. Deleted files
+appear in the listing with a name but have no flash data. The device does not
+compact or renumber remaining entries — flash table entries for surviving files
+stay in their original order.
+
+## Upload Protocol (from disassembly, not tested)
+
+Decoded from `CIcdComm4::AddMessageST` and `CIcdComm4::SetMessageInfo` in
+IcdComm4.dll. **Not captured in any USB session — the following is based
+solely on disassembly and has not been verified against a real device.**
+
+### Command (0x200 bytes)
+
+```
+Offset  Size  Description
+0x00    12    Standard magic header
+0x0c    1     Command = 0x10
+0x0d    1     (unused/padding)
+0x0e    2     htons(param_1) — hypothesized: folder number
+0x10    2     htons(param_2) — hypothesized: file index or slot
+0x12    2     htons(param_3) — sub-command (short, values -1/0/2 observed)
+0x14    4     htonl(data_size) — size of audio data to upload in bytes
+0x18    0x1e8 Serialized file metadata (see below)
+```
+
+### File metadata (0x1e8 bytes at offset 0x18)
+
+This is a serialized `_ENTRYTYPE1000FORPX` structure. `SetMessageInfo` has
+three modes: mode 0 copies raw (already big-endian), mode 1 byte-swaps from
+host to big-endian (used by `AddMessageST`), mode 2 byte-swaps from big-endian
+to host (used when reading).
+
+The structure fields correspond to the same data in the 512-byte file entry
+packets from the bulk listing, but at different offsets and with explicit
+byte-swapping. Key identified fields:
+
+```
+Struct   Wire
+offset   action    Description
+0x00     htons     Unknown uint16
+0x02-06  raw       5 bytes, unknown (byte at 0x07 skipped)
+0x08-0a  raw       3 bytes, unknown (byte at 0x0b skipped)
+0x0c     htons     Unknown uint16 (possibly codec/bitrate, 0x3318 observed)
+0x0e-12  raw       5 bytes, unknown
+0x18     64-bit    Hypothesized: file size or flash address (8 bytes, byte-swapped)
+0x22     htons     Year (e.g. 0x07ea = 2026)
+0x24     htons     Month/day packed
+0x26     htons     Hour/minute/second packed
+0x28     string    Filename (max 258 bytes, null-terminated)
+0x12a    htons     Unknown uint16
+0x12c    string    Device name (max 104 bytes, e.g. "SONY ICD-PX")
+0x198    64-bit    Hypothesized: file size or flash address (8 bytes, byte-swapped)
+0x1a0    htonl     Unknown uint32
+0x1a4    htons     Unknown uint16
+0x1a6    raw       1 byte, unknown
+0x1a8    memcpy    64 bytes raw data, unknown purpose
+```
+
+### Upload sequence (hypothesized)
+
+Based on the `AddMessageST` control flow:
+
+```
+1. SendCmd(command, 0x200 bytes)     — file metadata
+2. ReceiveCmd                        — interim acknowledgment
+3. BulkComm(audio_data, data_size)   — bulk transfer of MP3 data to device
+4. ReceiveCmd                        — final acceptance
+```
+
+The `BulkComm` call uses the OUT bulk endpoint (EP 0x02) which is present on
+the device but not used during download sessions.
+
+### What would be needed to implement upload
+
+- A USB capture of Digital Voice Editor uploading a file, to confirm the exact
+  byte values for the unknown fields and verify the command sequence
+- Understanding of which metadata fields the device validates vs ignores
+- The constant fields (codec info, device name) can likely be copied from any
+  existing file entry captured during a listing
+
 ## Audio Format
 
 - Raw CBR MP3 (no ID3 tags, no Xing/LAME/VBRI headers)

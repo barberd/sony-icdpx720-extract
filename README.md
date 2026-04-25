@@ -68,7 +68,7 @@ Each recording is stored as raw MP3 on the device's internal flash.
 
 ## Known quirks
 
-- File `090101_008` (a system-generated entry with no matching flash table record) is skipped during extraction.
+- Deleted recordings remain in the file listing but have no flash data; they are skipped during extraction.
 
 ## Compatibility
 
