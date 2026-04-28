@@ -10,6 +10,7 @@ Requirements:
   - Linux: No extra setup needed
 """
 import usb.core, usb.util, struct, time, sys, math
+from mutagen.id3 import ID3, TIT2, TPE1, TDRC, ID3NoHeaderError
 
 VID, PID = 0x054c, 0x0387
 EP_IN = 0x81
@@ -33,6 +34,115 @@ def poll_wait(dev):
 def read(dev, n):
     return bytes(dev.ctrl_transfer(0xc1, 129, 0xabab, 0, n, T))
 
+def get_folders(dev):
+    """Send GetFolderCount and parse response to discover folders."""
+    send(dev, M+b'\x09\x20\x00\xff'+b'\x00'*8)
+    poll_wait(dev); resp = read(dev, 356); poll(dev)
+    count = struct.unpack_from('>H', resp, 0x20)[0]
+    folders = []
+    for i in range(count):
+        off = 0x24 + i * 64
+        fc = struct.unpack_from('>H', resp, off)[0]
+        name = resp[off+2:off+64].split(b'\x00')[0].decode('ascii', errors='replace')
+        folders.append((i + 1, name, fc))  # (1-based index, name, file_count)
+    return folders
+
+def list_folder(dev, folder_idx):
+    """List files in a folder by index (1-based). Returns (files, sizes, exact)."""
+    # GetFolderCount then GetMessageInfoSizeST with folder index
+    send(dev, M+b'\x09\x20\x00\xff'+b'\x00'*8); poll_wait(dev); read(dev, 356); poll(dev)
+    send(dev, M+b'\x09\x10'+bytes([folder_idx])+b'\xff'+b'\x00'*8)
+    poll_wait(dev); read(dev, 24)
+
+    files, flash_table = [], None
+    file_idx = 0
+    for _ in range(500):
+        try: pkt = bytes(dev.read(EP_IN, 512, T))
+        except usb.core.USBTimeoutError: break
+        if pkt[:4] == b'\xff\xff\x90\x00':
+            name = pkt[4:20].split(b'\x00')[0].decode('ascii', errors='replace')
+            file_idx += 1
+            if name and not name.startswith('Z'):
+                year = struct.unpack_from('>H', pkt, 0x1c4)[0]
+                month, day = pkt[0x1c6], pkt[0x1c7]
+                hour, minute, sec = pkt[0x1c8], pkt[0x1c9], pkt[0x1ca]
+                friendly = f"{name}_{year}_{month:02d}_{day:02d}"
+                timestamp = f"{year}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:{sec:02d}"
+                files.append((friendly, file_idx, '', '', timestamp))
+        elif pkt[:4] == b'\xff\xff\x03\x00' and files and files[-1][1] == file_idx:
+            raw_title = pkt[4:262].split(b'\x00')[0]
+            raw_artist = pkt[0x114:0x17c].split(b'\x00')[0]
+            try:
+                title = raw_title.decode('ascii')
+                artist = raw_artist.decode('ascii')
+                friendly, idx, _, _, ts = files[-1]
+                files[-1] = (friendly, idx, title, artist, ts)
+            except UnicodeDecodeError:
+                pass
+        elif flash_table is None and len(pkt) >= 12 and pkt[8:12] == b'\x80\x00\x00\x00':
+            flash_table = pkt
+    poll_wait(dev); read(dev, 24); poll(dev)
+
+    sizes, exact = {}, {}
+    if flash_table:
+        n, total = 0, 0
+        for i in range(0, len(flash_table)-15, 16):
+            v = struct.unpack('>IIII', flash_table[i:i+16])
+            if v[0] == 0xffffffff: break
+            s = (v[0]<<32)|v[1]; e = ((v[2]&0x7fffffff)<<32)|v[3]
+            total += e - s + 1
+            if v[2] & 0x80000000:
+                n += 1
+                sizes[n] = math.ceil((total - 1) / 1024)
+                exact[n] = total
+                total = 0
+    return files, sizes, exact
+
+def relist_folder(dev, folder_idx):
+    """Re-list a folder before download (GetFolderCount + GetMessageInfoSizeST + drain bulk).
+    DVE does this before every file download to set up device state."""
+    send(dev, M+b'\x09\x20\x00\xff'+b'\x00'*8); poll_wait(dev); read(dev, 356); poll(dev)
+    send(dev, M+b'\x09\x10'+bytes([folder_idx])+b'\xff'+b'\x00'*8)
+    poll_wait(dev); read(dev, 24)
+    for _ in range(500):
+        try: dev.read(EP_IN, 512, T)
+        except usb.core.USBTimeoutError: break
+    poll_wait(dev); read(dev, 24); poll(dev)
+
+def download(dev, fname, name, folder_idx, file_idx, blocks, exact_size, title='', artist='', timestamp=''):
+    """Download a single file by folder and file index."""
+    print(f"Downloading {name}...", flush=True)
+    data = bytearray()
+    offset, first = 1, True
+    while offset < blocks:
+        end = min(offset + CHUNK - (1 if first else 0), blocks)
+        payload = struct.pack('>13H', folder_idx, file_idx, 0, 0, offset, 0, end,
+            0xffff, 0xffff, 0, 0, 0xf, 0xa000 if first else 0xa400)
+        send(dev, M+b'\x11\xff'+payload)
+        poll_wait(dev); read(dev, 40)
+        block = bytearray()
+        for p in range((end-offset+1)*2 + 10):
+            try: block.extend(dev.read(EP_IN, 512, 2000))
+            except usb.core.USBTimeoutError: break
+        poll_wait(dev); read(dev, 40); poll(dev)
+        data.extend(block if first else block[1024:])
+        first = False
+        offset = end
+        sys.stdout.write(f"\r  {len(data)*100//(blocks*1024)}%"); sys.stdout.flush()
+    sz = exact_size if exact_size else len(data)
+    path = f"{fname}_{name}.mp3"
+    with open(path, 'wb') as f:
+        f.write(data[:sz])
+    try:
+        tags = ID3()
+        if title: tags.add(TIT2(encoding=3, text=[title]))
+        if artist: tags.add(TPE1(encoding=3, text=[artist]))
+        if timestamp: tags.add(TDRC(encoding=3, text=[timestamp]))
+        if len(tags): tags.save(path, v1=2)
+    except Exception:
+        pass
+    print(f"\r  Saved {path} ({sz:,} bytes)")
+
 def main():
     dev = usb.core.find(idVendor=VID, idProduct=PID)
     if not dev:
@@ -55,88 +165,33 @@ def main():
     send(dev, M+b'\x09\x00\x03\xff'+b'\x00'*8); poll_wait(dev); read(dev, 48); poll(dev)
     send(dev, M+b'\x09\x00\x04\xff'+b'\x00'*8); poll_wait(dev); read(dev, 82); poll(dev)
 
-    # Set preference menu — selects folder "F" (all files view)
-    # This is CIcdComm4::SetPreferenceMenu with a _SETPREFERENCEMENUFORVOCE struct.
-    # The struct is normally read from the device, timestamp updated, and written back.
-    # Byte at offset 0x25 (0x46='F') controls the folder view.
-    send(dev, '00e000080046abab000000000a0004500000001a000000000001000000000001ff00ff0000460000010107ea0413101e0900')
-    poll_wait(dev); read(dev, 24); poll(dev)
+    # Discover folders
+    folders = get_folders(dev)
 
-    # List files
-    for _ in range(3):
-        send(dev, M+b'\x09\x20\x00\xff'+b'\x00'*8); poll_wait(dev); read(dev, 356); poll(dev)
-    send(dev, M+b'\x09\x10\x01\xff'+b'\x00'*8); poll_wait(dev); read(dev, 24)
+    print(f"Folders: {', '.join(f'{name} ({fc} files)' for _, name, fc in folders)}")
 
-    files, flash_table = [], None
-    file_idx = 0
-    for _ in range(500):
-        try: pkt = bytes(dev.read(EP_IN, 512, T))
-        except usb.core.USBTimeoutError: break
-        if pkt[:4] == b'\xff\xff\x90\x00':
-            name = pkt[4:20].split(b'\x00')[0].decode('ascii', errors='replace')
-            file_idx += 1
-            if name and not name.startswith('Z'):
-                files.append((name, file_idx))
-        elif flash_table is None and len(pkt) >= 12 and pkt[8:12] == b'\x80\x00\x00\x00':
-            flash_table = pkt
-    poll_wait(dev); read(dev, 24); poll(dev)
+    # Enumerate and download files per folder
+    all_files = []
+    for fidx, fname, fc in folders:
+        if fc == 0:
+            continue
+        files, sizes, exact = list_folder(dev, fidx)
+        folder_files = []
+        for friendly, idx, title, artist, timestamp in files:
+            blocks = sizes.get(idx)
+            sz = exact.get(idx, 0)
+            folder_files.append((friendly, idx, blocks, sz, title, artist, timestamp))
+            all_files.append((fname, friendly, sz))
 
-    # Parse flash table — entries map 1:1 with file listing order
-    # Multi-segment files use consecutive entries; last segment has bit 31 set in end_high
-    sizes, exact = {}, {}
-    if flash_table:
-        n, total = 0, 0
-        for i in range(0, len(flash_table)-15, 16):
-            v = struct.unpack('>IIII', flash_table[i:i+16])
-            if v[0] == 0xffffffff: break
-            s = (v[0]<<32)|v[1]; e = ((v[2]&0x7fffffff)<<32)|v[3]
-            total += e - s + 1
-            if v[2] & 0x80000000:  # last segment
-                n += 1
-                sizes[n] = math.ceil(total / 1024)
-                exact[n] = total
-                total = 0
+        # Download this folder's files immediately while device state is correct
+        for friendly, idx, blocks, sz, title, artist, timestamp in folder_files:
+            if not blocks:
+                print(f"Skipping {friendly} (no size info)"); continue
+            relist_folder(dev, fidx)
+            download(dev, fname, friendly, fidx, idx, blocks, sz, title, artist, timestamp)
 
-    if not files:
+    if not all_files:
         print("No recordings found."); return
-
-    print(f"Found {len(files)} recording(s):")
-    for name, idx in files:
-        sz = exact.get(idx, 0)
-        print(f"  {name} ({sz:,} bytes)" if sz else f"  {name}")
-
-    # Download
-    for name, idx in files:
-        blocks = sizes.get(idx)
-        if not blocks:
-            print(f"Skipping {name} (no size info)"); continue
-
-        print(f"Downloading {name}...", flush=True)
-        data = bytearray()
-        offset, first = 1, True
-
-        while offset < blocks:
-            end = min(offset + CHUNK - (1 if first else 0), blocks)
-            payload = struct.pack('>13H', 1, idx, 0, 0, offset, 0, end,
-                0xffff, 0xffff, 0, 0, 0xf, 0xa000 if first else 0xa400)
-            send(dev, M+b'\x11\xff'+payload)
-            poll_wait(dev); read(dev, 40)
-
-            block = bytearray()
-            for p in range((end-offset+1)*2):
-                try: block.extend(dev.read(EP_IN, 512, 2000))
-                except usb.core.USBTimeoutError: break
-            poll_wait(dev); read(dev, 40); poll(dev)
-
-            data.extend(block if first else block[1024:])
-            first = False
-            offset = end
-            sys.stdout.write(f"\r  {len(data)*100//(blocks*1024)}%"); sys.stdout.flush()
-
-        sz = exact.get(idx, len(data))
-        with open(f"{name}.mp3", 'wb') as f:
-            f.write(data[:sz])
-        print(f"\r  Saved {name}.mp3 ({sz:,} bytes)")
 
     usb.util.dispose_resources(dev)
     print("Done!")

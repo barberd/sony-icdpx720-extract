@@ -2,7 +2,7 @@
 
 Reverse-engineered from USB capture (Wireshark usbmon) of Sony Digital Voice
 Editor communicating with the device, plus disassembly of
-IcdNStor3.dll and IcdComm4.dll from the DVE3 installer.
+IcdNStor3.dll, IcdComm4.dll, and PXVoice.dll from the DVE3 installer.
 
 ## USB Device Info
 
@@ -42,7 +42,7 @@ Every command follows this sequence:
 SEND(command) → POLL_WAIT(until byte[1] & 0x80) → READ(N) → POLL(expect 0x00000000)
 ```
 
-For commands that trigger bulk data (LIST_END, READ_FILE):
+For commands that trigger bulk data (GetMessageInfoSizeST, GetVoiceDataST):
 
 ```
 SEND → POLL_WAIT → READ(response) → [bulk IN packets] → POLL_WAIT → READ(completion) → POLL
@@ -60,43 +60,64 @@ This is a fixed constant stored in IcdComm4.dll at offset 0x28184.
 
 Followed by a 2-byte command code, then command-specific payload.
 
-### Command Codes
+### Command Codes (from CIcdComm4 disassembly)
 
-| Code | Name | Payload | Description |
-|------|------|---------|-------------|
-| 09 00 | QUERY | sub(1) + 0xff + 8×0x00 | Query device info. sub: 01=device info, 03=capabilities, 04=storage |
-| 09 20 | LIST_READ | 00 ff + 8×0x00 | Read next page of folder/file listing |
-| 09 10 | LIST_END | 01 ff + 8×0x00 | End listing, triggers bulk file entry dump |
-| 0a 00 | SET_PREFERENCE | sub + payload | Set device preferences (CIcdComm4::SetPreferenceMenu). Used to select folder view. |
-| 11 ff | READ_FILE | 26-byte payload | Download file data |
+| Cmd  | Sub (wire) | DLL Function | Description |
+|------|-----------|--------------|-------------|
+| 0x09 | 00 01 | GetTargetIdentifier | Device info (model string, 116-byte response) |
+| 0x09 | 00 03 | GetTargetStatusST | Device status (48-byte response, may need 2+ polls) |
+| 0x09 | 00 04 | GetPreferenceInfo | Read preferences from device (82-byte response) |
+| 0x09 | 20 00 | GetFolderCount | Enumerate folders (response contains count + folder entries) |
+| 0x09 | 10 01 | GetMessageInfoSizeST | End listing, triggers bulk file entry dump |
+| 0x0a | — | SetPreferenceMenu | Write preferences to device (selects folder view) |
+| 0x11 | ff | GetVoiceDataST | Download file data (26-byte payload) |
+| 0x10 | — | AddMessageST | Upload file data (not tested) |
+| 0x12 | — | DeleteMessage | Delete recording (not tested) |
 
-### QUERY Responses
+Command 0x09 is a generic query command. The sub-command at offset 0x0d is a
+big-endian uint16 (htons-swapped). For example, GetFolderCount pushes
+`htons(0x2000)` which produces wire bytes `0x20 0x00`.
 
-| Sub | Response Size | Content |
-|-----|--------------|---------|
-| 0x01 | 116 bytes | Device info, contains model string "ICD-PX720" at ~offset 0x24 |
-| 0x03 | 48 bytes | Unknown, possibly capabilities. Needs 2+ polls before ready. |
-| 0x04 | 82 bytes | Storage info |
+### GetTargetIdentifier Response (116 bytes)
 
-### SET_PREFERENCE (SetPreferenceMenu)
+Contains device model string "ICD-PX720" at approximately offset 0x24.
 
-Command 0x0a with sub-command at offset 0x0d-0x0e. This is
-`CIcdComm4::SetPreferenceMenu`, which writes a 26-byte
+### GetFolderCount Response
+
+Returns folder count and folder entries in a single response. The response
+size depends on the number of folders (e.g. 356 bytes for 5 folders).
+
+```
+Offset  Size  Description
+0x20    2     Folder count (big-endian uint16, ntohs to get host value)
+0x24    N×64  Folder entries (_ENTRYTYPE2000 structs)
+```
+
+Each folder entry (`_ENTRYTYPE2000`) is 64 bytes:
+
+```
+Offset  Size  Description
+0x00    2     File count in this folder (big-endian uint16)
+0x02    62    Folder name (null-terminated ASCII string, e.g. "A", "B")
+```
+
+For folder index `i` (0-based), the entry starts at response offset
+`0x24 + i × 64`. The folder name character (e.g. 'A') is used as the
+folder ID in SetPreferenceMenu.
+
+The same command is sent 3× during DVE initialization. All three responses
+appear identical; only the first is needed.
+
+### SetPreferenceMenu
+
+Command 0x0a. This is `CIcdComm4::SetPreferenceMenu`, which writes a 26-byte
 `_SETPREFERENCEMENUFORVOCE` struct to the device. Sony's software
-(PXVoice.dll) reads the current preferences from the device, updates the
-timestamp with the current local time, and writes them back during
-initialization. The folder view byte (offset 0x25) controls which folder
-the subsequent LIST commands enumerate.
+(PXVoice.dll) reads the current preferences via GetPreferenceInfo, updates
+the timestamp with the current local time, and writes them back. The folder
+ID at struct offset 0x0c controls which folder subsequent
+GetMessageInfoSizeST commands enumerate.
 
-The "all folders" variant (folder "F") is a fixed 50-byte packet:
-
-```
-00e000080046abab 00000000 0a0004 50 0000001a
-00000000 0001 000000000001 ff00ff 0046
-0000 0101 07ea 0413 101e 0900
-```
-
-Packet structure:
+Packet structure (50 bytes total):
 
 ```
 Offset  Size  Description
@@ -106,40 +127,53 @@ Offset  Size  Description
 0x0f    1     Constant 0x50 ('P')
 0x10    4     htonl(0x1a) — payload size (26 bytes)
 0x14    4     htonl(0x00)
-0x18    26    _SETPREFERENCEMENUFORVOCE struct (copied mostly raw, uint16 at
-              struct offset 0x0c is byte-swapped via htons)
+0x18    26    _SETPREFERENCEMENUFORVOCE struct
 ```
 
-Key fields in the 26-byte struct (at packet offset 0x18):
+The struct is bulk-copied to packet offset 0x18, then the uint16 at struct
+offset 0x0c is byte-swapped via htons() and written to packet offset 0x24,
+overwriting the raw-copied bytes at that position.
+
+Key fields in the 26-byte `_SETPREFERENCEMENUFORVOCE` struct:
 
 ```
-Struct   Packet
-offset   offset   Description
-0x11     0x29     Folder letter: 'A'-'E' for individual folders, 'F' for all
-0x16     0x2e     Timestamp: year (big-endian uint16)
-0x18     0x30     Timestamp: month, day
-0x1a     0x32     Timestamp: hour, minute (only 2 bytes shown; seconds follow)
+Struct   Packet   Wire
+offset   offset   bytes    Description
+0x0c     0x24     2        Folder ID (uint16, htons-swapped). Use the folder_id
+                           value from GetFolderCount/GetFolderInfo responses.
+0x11     0x29     1        Timestamp valid flag (0x01=valid, 0x00=invalid)
+0x12     0x2a     2        Timestamp: year (big-endian uint16, e.g. 0x07ea=2026)
+0x14     0x2c     1        Timestamp: month
+0x15     0x2d     1        Timestamp: day
+0x16     0x2e     1        Timestamp: hour
+0x17     0x2f     1        Timestamp: minute
+0x18     0x30     1        Timestamp: second
+0x19     0x31     1        Timestamp: day of week
 ```
 
-A second variant uses sub-command 0x0001 (by-name) with the folder name as a
-string (e.g. "User") in the payload instead of the struct.
+To select a folder, set the uint16 at struct offset 0x0c to the ASCII value
+of the folder name character from the GetFolderCount response. For example,
+folder "A" uses value 0x0041. On a little-endian host, this is stored in
+memory as bytes `0x41 0x00`. SetPreferenceMenu reads this as host uint16
+0x0041, applies htons() to get 0x4100, and stores it at packet offset 0x24
+as little-endian bytes `0x00 0x41` — which is big-endian 0x0041 on the wire.
 
-### READ_FILE Payload (26 bytes = 13 big-endian uint16)
+### GetVoiceDataST Payload (26 bytes = 13 big-endian uint16)
 
 ```
-[0]  0x0001   constant
-[1]  file_idx  1-based file index
+[0]  folder_idx  1-based folder index (from GetFolderCount)
+[1]  file_idx    1-based file index (within the folder's listing)
 [2]  0x0000
 [3]  0x0000
-[4]  offset    start block (1-based, inclusive)
+[4]  offset      start block (1-based, inclusive)
 [5]  0x0000
-[6]  end       end block (inclusive)
+[6]  end         end block (inclusive)
 [7]  0xffff
 [8]  0xffff
 [9]  0x0000
 [10] 0x0000
-[11] flags1    0x000f for download, 0x0001 for preview
-[12] flags2    0xa000 first chunk, 0xa400 continuation
+[11] flags1      0x000f for download, 0x0001 for preview
+[12] flags2      0xa000 first chunk, 0xa400 continuation
 ```
 
 Block size = 1024 bytes. Each block = 2 bulk packets (512 bytes each).
@@ -148,21 +182,52 @@ Block size = 1024 bytes. Each block = 2 bulk packets (512 bytes each).
 
 ```
 1. GET_STATUS → POLL
-2. QUERY 0x01 → POLL_WAIT → READ(116) → POLL
-3. QUERY 0x03 → POLL_WAIT → READ(48) → POLL    (may need 2+ polls)
-4. QUERY 0x04 → POLL_WAIT → READ(82) → POLL
-5. SET_PREFERENCE "F" → POLL_WAIT → READ(24) → POLL
-6. LIST_READ ×3 → (each: POLL_WAIT → READ(356) → POLL)
-7. LIST_END → POLL_WAIT → READ(24)
+2. GetTargetIdentifier → POLL_WAIT → READ(116) → POLL
+3. GetTargetStatusST → POLL_WAIT → READ(48) → POLL    (may need 2+ polls)
+4. GetPreferenceInfo → POLL_WAIT → READ(82) → POLL
+5. SetPreferenceMenu(folder) → POLL_WAIT → READ(24) → POLL
+6. GetFolderCount ×3 → (each: POLL_WAIT → READ(356) → POLL)
+7. GetMessageInfoSizeST → POLL_WAIT → READ(24)
 8. [bulk file listing packets]
 9. POLL_WAIT → READ(24) → POLL
 ```
 
+## Folder Enumeration
+
+Folders are dynamically enumerated from the device, not hardcoded per model.
+The `GetFolderCount` command (0x09 sub 0x2000) returns both the folder count
+and folder entry data. `IcdNStor3.dll::GetFolderNStor` implements the
+enumeration loop:
+
+1. Call `GetFolderCount` → get count from response offset 0x20 (ntohs)
+2. For each folder index 1..count:
+   - Call `GetFolderInfo(index)` → read folder ID and name from response
+   - Store folder ID in per-folder array
+
+Folder selection for file listing is done via the **GetMessageInfoSizeST
+sub-command**, not via SetPreferenceMenu. The sub-command byte at wire offset
+0x0e encodes the 1-based folder index: `0x01` = folder A, `0x02` = folder B,
+etc. SetPreferenceMenu is sent once during initialization and does not need
+to change per folder.
+
+To list files in a specific folder:
+
+1. Send `GetFolderCount` (1×)
+2. Send `GetMessageInfoSizeST` with sub-command `0x10 0x0N` where N = folder index
+3. Read bulk packets → file entries and flash address table
+
+**Important**: The device requires a `GetFolderCount` + `GetMessageInfoSizeST`
++ bulk drain cycle before each file download, even when downloading multiple
+files from the same folder. DVE re-lists the folder before every download
+operation. Omitting this causes pipe errors on subsequent downloads or when
+switching folders.
+
 ## Bulk File Listing Format
 
-After LIST_END + READ(24), the device sends ~115 bulk packets (512 bytes each)
-containing the complete file inventory. No explicit trigger needed — device
-starts sending after the LIST_END response.
+After GetMessageInfoSizeST + READ(24), the device sends ~115 bulk packets
+(512 bytes each) containing the complete file inventory for the selected
+folder. No explicit trigger needed — device starts sending after the
+GetMessageInfoSizeST response.
 
 ### Packet Types in Bulk Listing
 
@@ -186,42 +251,63 @@ segment of the file. If clear, the next record continues the same file.
 Multi-segment files occur when a recording spans non-contiguous flash regions
 (e.g. after deletions create gaps). Total file size = sum of all segment sizes.
 
-**File Entry** (1 packet each, starting ~packet index 15):
-Identified by first 4 bytes = `ff ff 90 00`.
+**File Entry** (2 packets each, starting ~packet index 15):
+
+Each file entry consists of two consecutive 512-byte bulk packets. The first
+is the main entry, the second contains extended metadata (title, artist).
+
+*Main entry packet* — identified by first 4 bytes = `ff ff 90 00`:
 
 ```
 Offset  Size  Description
-0x000   4     Magic: ff ff 90 00
+0x000   2     Marker: ff ff
+0x002   1     Type: 0x90 (main entry)
+0x003   1     Flags: 0x00
 0x004   16    Filename (null-terminated ASCII, e.g. "250411_001")
-0x014   242   Zeros (padding)
 0x106   10    ff padding
-0x110   4     ff ff 90 00 (second marker)
-0x114   104   Zeros
+0x110   2     Marker: ff ff
+0x112   1     Type: 0x03
+0x113   1     Flags: 0x00
+0x114   92    User name (null-terminated ASCII, e.g. "User")
 0x17c   4     ff ff ff ff
-0x180   2     00 00
-0x182   2     Constant 0x3318 across all files (possibly bitrate-related)
-0x184   60    ff padding
-0x1c0   1     Unknown (values: 0x78, 0x31, 0x38, 0xac — not correlated with size)
-0x1c1   1     0x00
-0x1c2   2     00 ff
+0x182   2     Codec/bitrate (big-endian, e.g. 0x3318 = 192kbps MP3)
 0x1c4   2     Year (big-endian, e.g. 0x07e9 = 2025)
 0x1c6   1     Month
 0x1c7   1     Day
 0x1c8   1     Hour
 0x1c9   1     Minute
 0x1ca   1     Second
-0x1cb   1     Unknown (0x05 for 2025 recordings)
-0x1cc   11    Device name "SONY ICD-PX" (null-terminated)
-0x1e4   8     Constant 33 09 0c 01 14 68 65 5f (firmware/serial?)
-0x1ff   1     Unknown — possibly a device-internal flash block identifier
+0x1cc   11    Device name (null-terminated, "SONY ICD-PX")
 ```
+
+*Extended metadata packet* — identified by first 4 bytes = `ff ff 03 00`:
+
+Same layout as the main entry, with different fields populated:
+
+```
+Offset  Size  Description
+0x000   2     Marker: ff ff
+0x002   1     Type: 0x03 (extended metadata)
+0x003   1     Flags: 0x00
+0x004   258   Title (null-terminated ASCII, from ID3 TIT2 tag if copied MP3)
+0x110   2     Marker: ff ff
+0x112   1     Type: 0x03
+0x113   1     Flags: 0x00
+0x114   92    Artist (null-terminated ASCII, from ID3 TPE1 tag if copied MP3)
+0x182   2     Codec/bitrate (may differ from main entry for copied files)
+```
+
+For native recordings, the extended packet may contain user-entered text or
+uninitialized data. For MP3 files copied to the device, the title and artist
+fields contain metadata extracted from the file's ID3 tags by the device
+firmware.
 
 Files starting with "Z" (e.g. Z0000040) are system/empty slots, not recordings.
 
 ### Byte at 0x1ff
 
-Purpose not fully understood. Values observed (0xa0, 0x2e, 0xeb, 0x95) don't
-correlate with file listing order or flash table position. May be a
+Purpose not fully understood. Values observed (0xa0, 0x2e, 0xeb, 0x95, 0xda)
+don't correlate with file listing order or flash table position. May be a
 device-internal flash block identifier. Not needed for extraction.
 
 ## Download Protocol
@@ -231,9 +317,9 @@ Each file is downloaded in chunks of 1000 blocks (1,024,000 bytes).
 ### Chunk Sequence
 
 ```
-SEND(READ_FILE) → POLL_WAIT → READ(40)    # pre-bulk
-[bulk IN packets]                           # audio data
-POLL_WAIT → READ(40) → POLL               # post-bulk completion
+SEND(GetVoiceDataST) → POLL_WAIT → READ(40)    # pre-bulk
+[bulk IN packets]                                # audio data
+POLL_WAIT → READ(40) → POLL                     # post-bulk completion
 ```
 
 ### Chunk Parameters
@@ -423,12 +509,9 @@ for endian conversion — the protocol is big-endian on the wire.
    duration, or recording quality. Not needed for extraction.
 
 3. **File 090101_008**: Present in file listing but has no flash table entry.
-   May be in a different folder or use a different storage format. The byte
-   at 0x1ff for this file was 0x95 vs 0xa0/0x2e/0xeb for the three working files.
+   Likely a recording in a different folder that appears as a ghost entry
+   when listing folder A. The byte at 0x1ff for this file was 0x95 vs
+   0xa0/0x2e/0xeb for the three working files.
 
-4. **Multiple folders**: Only tested with folder "F" (all files). Selecting
-   individual folders (A-E) likely requires changing the folder byte (offset
-   0x25) in the SET_PREFERENCE packet.
-
-5. **Write support**: The protocol likely supports uploading/deleting recordings
+4. **Write support**: The protocol likely supports uploading/deleting recordings
    but this has not been explored.
